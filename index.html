@@ -76,6 +76,9 @@ const TAU = Math.PI * 2;
 let highScore = 0, storedHigh = 0;
 try { highScore = parseInt(localStorage.getItem('starShooterHigh') || '0', 10) || 0; } catch (e) {}
 storedHigh = highScore;
+let beaten = false;
+try { beaten = localStorage.getItem('starShooterBeaten') === '1'; } catch (e) {}
+function saveBeaten() { beaten = true; try { localStorage.setItem('starShooterBeaten', '1'); } catch (e) {} }
 function saveHigh() { storedHigh = highScore; try { localStorage.setItem('starShooterHigh', String(highScore)); } catch (e) {} }
 
 // =====================================================================
@@ -177,6 +180,20 @@ const Sound = {
   beam() { if (!this.ok('beam', 0.1)) return; this.tone('sawtooth', 1600, 90, 0.5, 0.14); this.noise(0.5, 0.2, 3000); },
   charge() { if (!this.ok('charge', 0.3)) return; this.tone('sine', 180, 1400, 0.8, 0.07); },
   missile() { if (!this.ok('mis', 0.12)) return; this.noise(0.12, 0.08, 2500, 0, 'bandpass'); this.tone('triangle', 900, 1300, 0.08, 0.03); },
+  levelUp(lv) { const b = 659 * Math.pow(2, lv / 6); [0, 7, 12].forEach((s, i) => this.tone('square', b * Math.pow(2, s / 12), b * Math.pow(2, s / 12), 0.1, 0.08, i * 0.05)); },
+  shieldUp() { this.tone('sine', 400, 1200, 0.25, 0.08); this.tone('triangle', 1200, 1200, 0.15, 0.05, 0.2); },
+  pop() { if (!this.ok('pop', 0.09)) return; this.noise(0.35, 0.18, 2500, 0, 'highpass'); this.tone('sine', rand(700, 1100), 150, 0.25, 0.08); },
+  victory() {
+    const seq = [[392, .12], [523, .12], [659, .12], [784, .12], [1046, .36], [880, .12], [988, .12], [1046, .12], [1175, .12], [1318, .7]];
+    let t = 0.1;
+    for (const [f, d] of seq) { this.tone('square', f, f, d * 0.95, 0.09, t); this.tone('triangle', f / 2, f / 2, d * 0.95, 0.08, t); t += d; }
+    [523, 659, 784, 1046].forEach(f => this.tone('triangle', f, f, 1.6, 0.07, t));
+    this.tone('sawtooth', 131, 131, 1.6, 0.06, t);
+    for (let i = 0; i < 6; i++) this.tone('sine', 160, 42, 0.22, 0.4, 0.1 + i * 0.36);
+    this.noise(1.2, 0.2, 7000, t, 'highpass');
+  },
+  bells() { [1046, 1318, 1568, 2093, 1568, 1318, 1046, 1568].forEach((f, i) => { this.tone('sine', f, f, 1.1, 0.07, i * 0.28); this.tone('sine', f * 2.01, f * 2.01, 0.6, 0.025, i * 0.28); }); },
+  whoosh() { this.noise(1.6, 0.25, 600, 0, 'bandpass'); this.tone('sawtooth', 120, 600, 1.4, 0.05); },
   start() { [262, 392, 523, 784, 1046].forEach((f, i) => this.tone('square', f, f, 0.1, 0.09, i * 0.06)); },
   over() { [392, 330, 262, 196, 131].forEach((f, i) => this.tone('triangle', f, f * 0.97, 0.32, 0.18, i * 0.2)); },
   laser(on) {
@@ -256,6 +273,13 @@ window.addEventListener('blur', () => { for (const k in keys) keys[k] = false; t
 function onKeyPress(k) {
   if (k === 'm') { Sound.toggle(); return; }
   if (k === 'n') { Sound.toggleMusic(); return; }
+  if (state === 'cutscene') { if (cutT > CUT_SKIP && (k === ' ' || k === 'enter' || k === 'escape')) enterVictory(); return; }
+  if (state === 'victory') {
+    if (victoryT < VICTORY_LOCK) return;
+    if (k === 'k' || k === 'enter') keepPlaying();
+    else if (k === 'r' || k === ' ') startGame();
+    return;
+  }
   if (k === ' ' || k === 'enter') {
     if (state === 'title') startGame();
     else if (state === 'over' && overTimer <= 0) startGame();
@@ -280,6 +304,8 @@ function fingerOffset() { return Math.max(70, 85 * SCALE); } // ship sits above 
 canvas.addEventListener('touchstart', e => {
   e.preventDefault(); Sound.init(); isTouch = true;
   const t = e.changedTouches[0];
+  if (state === 'cutscene') { if (cutT > CUT_SKIP) enterVictory(); return; }
+  if (state === 'victory') { victoryTap(t.clientX, t.clientY); return; }
   if (state === 'title') { startGame(); }
   else if (state === 'over') { if (overTimer <= 0) startGame(); return; }
   else {
@@ -303,7 +329,9 @@ canvas.addEventListener('touchcancel', endTouch);
 canvas.addEventListener('mousedown', e => {
   if (isTouch && e.sourceCapabilities && e.sourceCapabilities.firesTouchEvents) return;
   Sound.init();
-  if (state === 'title') startGame();
+  if (state === 'cutscene') { if (cutT > CUT_SKIP) enterVictory(); }
+  else if (state === 'victory') victoryTap(e.clientX, e.clientY);
+  else if (state === 'title') startGame();
   else if (state === 'over' && overTimer <= 0) startGame();
   else if (state === 'play' || state === 'paused') {
     const b = btnRects();
@@ -394,33 +422,49 @@ let score = 0, lives = 3, wave = 0, waveQueue = [], spawnTimer = 0, waveDelay = 
 let flash = 0, flashColor = '255,255,255', time = 0, slowmo = 0, timeScale = 1, hitstop = 0;
 let combo = 0, comboTimer = 0, mult = 1, bestMult = 1, coinCount = 0, coinChain = 0, coinChainT = 0;
 let waveDamaged = false, waveCleared = true, seenPowers = new Set(), newHigh = false, kills = 0;
+let seenEnemies = new Set();
+// Enemy roster (names shown above each enemy; bosses keep their own names)
+const ENEMY_NAMES = { drifter: 'ASTEROID KILLER', zigzag: 'TERMINATOR', shooter: 'MURDERER', minion: 'BUZZ BUG', squad: 'SKY SQUAD' };
+let victoryPending = 0, victoryShown = false, victoryT = 0, playTime = 0, fireworksT = 0;
+const VICTORY_LOCK = 2.0; // seconds before ending-screen buttons accept input
+let cutT = 0, cutEv = {};
+const CUT_LEN = 31.0, CUT_SKIP = 1.0; // ending cutscene length / tap-to-skip delay
 
 const POWERS = {
-  rapid:  { color: '#39ff14', label: 'R', name: 'RAPID FIRE',      desc: 'FASTER SHOTS',     dur: 10, w: 3 },
-  spread: { color: '#00aaff', label: 'S', name: 'SPREAD SHOT',     desc: '5-WAY FIRE',       dur: 10, w: 3 },
-  shield: { color: '#ff66ff', label: 'O', name: 'SHIELD',          desc: 'BLOCKS ONE HIT',   dur: 14, w: 2.2 },
-  homing: { color: '#ff9f1c', label: 'H', name: 'HOMING MISSILES', desc: 'SEEK & DESTROY',   dur: 10, w: 2 },
-  laser:  { color: '#ff2a6d', label: 'L', name: 'LASER BEAM',      desc: 'PIERCING BEAM',    dur: 7,  w: 1.6 },
-  magnet: { color: '#ffe600', label: 'M', name: 'COIN MAGNET',     desc: 'PULLS IN COINS',   dur: 14, w: 2 },
-  bomb:   { color: '#ffffff', label: 'B', name: 'MEGA BOMB',       desc: 'BOMB CHARGED!',    dur: 0,  w: 1.1 }
+  rapid:  { color: '#39ff14', label: 'R', name: 'RAPID FIRE',      desc: 'FASTER SHOTS — PERMANENT',   w: 3 },
+  spread: { color: '#00aaff', label: 'S', name: 'SPREAD SHOT',     desc: 'MULTI-WAY FIRE — PERMANENT', w: 3 },
+  shield: { color: '#ff66ff', label: 'O', name: 'SHIELD',          desc: 'BLOCKS A HIT, RECHARGES',    w: 2.2 },
+  homing: { color: '#ff9f1c', label: 'H', name: 'HOMING MISSILES', desc: 'SEEK & DESTROY — PERMANENT', w: 2 },
+  laser:  { color: '#ff2a6d', label: 'L', name: 'LASER BEAM',      desc: 'PIERCING BEAM — PERMANENT',  w: 1.6 },
+  magnet: { color: '#ffe600', label: 'M', name: 'COIN MAGNET',     desc: 'PULLS IN COINS — PERMANENT', w: 2 },
+  bomb:   { color: '#ffffff', label: 'B', name: 'MEGA BOMB',       desc: 'BOMB CHARGED!',              w: 1.1 }
 };
-const TIMED = ['rapid', 'spread', 'shield', 'homing', 'laser', 'magnet'];
+// Permanent, stackable power-ups: each has level 0-3; duplicates level up, extra pickups at MAX give a bonus.
+const PERMA = ['rapid', 'spread', 'homing', 'laser', 'magnet', 'shield'];
+const MAXLV = 3;
+const RAPID_CD = [0.17, 0.12, 0.095, 0.075];
+const LASER_DPS = [0, 9, 14, 20], LASER_W = [0, 8, 12, 16];
+const MAGNET_R = [75, 220, 380, 99999];
+const SHIELD_RECHARGE = [0, 10, 8, 6];
+function powerTotal() { let t = 0; if (player) for (const k of PERMA) t += player.pw[k]; return t; }
+function laserWidth() { return LASER_W[player.pw.laser] * SCALE + 4; }
 const BOSSES = [
-  { name: 'WARDEN', color: '#ff3355' },
-  { name: 'HYDRA', color: '#7dff3a' },
+  { name: 'THE VOID TO HELL', color: '#ff3355' },
+  { name: 'THE NAMELESS KING', color: '#7dff3a' },
   { name: 'VOID EYE', color: '#b04bff' }
 ];
 
 function startGame() {
   Sound.init(); Sound.start();
   player = { x: W / 2, y: H - SAFE.bottom - Math.max(120, H * 0.2), r: 14, fireCd: 0, misCd: 0, invuln: 2, bomb: 0.35, tilt: 0,
-    pw: { rapid: 0, spread: 0, shield: 0, homing: 0, laser: 0, magnet: 0 }, lasering: false };
+    pw: { rapid: 0, spread: 0, shield: 0, homing: 0, laser: 0, magnet: 0 }, shieldUp: false, shieldT: 0, lasering: false };
   bullets = []; missiles = []; eBullets = []; enemies = []; particles = []; rings = []; powerups = []; coins = [];
   floaters = []; timers = []; beams = []; banner = null;
   score = 0; lives = 3; wave = 0; waveQueue = []; spawnTimer = 0; waveDelay = 1; shake = 0; flash = 0;
   slowmo = 0; timeScale = 1; hitstop = 0;
   combo = 0; comboTimer = 0; mult = 1; bestMult = 1; coinCount = 0; coinChain = 0; kills = 0;
   waveDamaged = false; waveCleared = true; seenPowers = new Set(); newHigh = false; overTimer = 0;
+  victoryPending = 0; victoryShown = false; victoryT = 0; playTime = 0; seenEnemies = new Set();
   touch.active = false;
   state = 'play';
 }
@@ -456,24 +500,27 @@ function nextWave() {
 }
 function bossSuffix(lvl) { const mk = Math.floor((lvl - 1) / 3); return mk ? ' MK ' + ['II', 'III', 'IV', 'V', 'VI'][Math.min(mk - 1, 4)] : ''; }
 
-function spawnEnemy(type, x, y) {
-  const diff = 1 + (wave - 1) * 0.08;
+function spawnEnemy(type, x, y, kind) {
+  const diff = 1 + (wave - 1) * 0.08, pt = powerTotal();
   let e;
   switch (type) {
     case 'vform': {
       const cx = rand(80, W - 80), vy = 95 * diff;
-      for (let k = -2; k <= 2; k++) spawnEnemy('drifter', clamp(cx + k * 30 * EN, 20, W - 20), -30 - Math.abs(k) * 26);
+      for (let k = -2; k <= 2; k++) spawnEnemy('drifter', clamp(cx + k * 34 * EN, 20, W - 20), -30 - Math.abs(k) * 30, 'squad');
       for (let k = enemies.length - 5; k < enemies.length; k++) { enemies[k].vx = 0; enemies[k].vy = vy; }
       return;
     }
     case 'drifter':
-      e = { type, x: x != null ? x : rand(30, W - 30), y: y != null ? y : -30, vx: rand(-30, 30), vy: rand(70, 110) * diff, r: 14 * EN, hp: 1, color: '#00f0ff', pts: 100, coins: 1 }; break;
+      e = { type, x: x != null ? x : rand(30, W - 30), y: y != null ? y : -30, vx: rand(-30, 30), vy: rand(70, 110) * diff, r: 14 * EN, hp: 2 + Math.floor(wave / 5) + Math.floor(pt / 6), color: '#00f0ff', pts: 100, coins: 1 };
+      if (kind === 'squad') { e.color = '#7fb8ff'; e.pts = 120; }
+      if (kind === 'minion') { e.color = '#ff6b8b'; e.pts = 60; e.r = 11 * EN; e.hp = 2 + Math.floor(pt / 8); }
+      break;
     case 'zigzag':
-      e = { type, x: rand(60, W - 60), y: -30, vy: rand(80, 120) * diff, amp: rand(40, Math.min(120, W * 0.2)), freq: rand(2, 3.5), r: 13 * EN, hp: 2, color: '#ff2fd6', pts: 150, coins: randi(1, 2) }; e.baseX = e.x; break;
+      e = { type, x: rand(60, W - 60), y: -30, vy: rand(80, 120) * diff, amp: rand(40, Math.min(120, W * 0.2)), freq: rand(2, 3.5), r: 13 * EN, hp: 3 + Math.floor(wave / 5) + Math.floor(pt / 5), color: '#ff2fd6', pts: 200, coins: randi(1, 2) }; e.baseX = e.x; break;
     case 'shooter':
-      e = { type, x: rand(50, W - 50), y: -30, vy: 90, stopY: rand(SAFE.top + H * 0.15, H * 0.42), r: 17 * EN, hp: 3 + Math.floor(wave / 4), color: '#ffb300', pts: 250, coins: randi(2, 3), fireCd: rand(1, 2), vx: rand(-60, 60) }; break;
+      e = { type, x: rand(50, W - 50), y: -30, vy: 90, stopY: rand(SAFE.top + H * 0.15, H * 0.42), r: 17 * EN, hp: 6 + Math.floor(wave / 4) + Math.floor(pt / 3), color: '#ffb300', pts: 350, coins: randi(2, 3), fireCd: rand(1, 2), vx: rand(-60, 60) }; break;
     case 'boss': {
-      const lvl = wave / 5, v = (lvl - 1) % 3, mk = Math.floor((lvl - 1) / 3), hp = 80 + lvl * 50;
+      const lvl = wave / 5, v = (lvl - 1) % 3, mk = Math.floor((lvl - 1) / 3), hp = Math.round((80 + lvl * 50) * (1 + 0.1 * powerTotal()));
       e = { type, v, mk, lvl, name: BOSSES[v].name + bossSuffix(lvl), color: BOSSES[v].color, x: W / 2, y: -140,
         stopY: SAFE.top + Math.max(175, H * 0.22), r: 52 * EN, hp, maxHp: hp, atkT: 1.5, atk: 0, spin: 0, stream: null,
         pts: 5000 * lvl, coins: 40, entered: false, raged: false, dying: 0 };
@@ -482,6 +529,10 @@ function spawnEnemy(type, x, y) {
     }
   }
   e.t = 0; e.flash = 0; e.dead = false;
+  if (type !== 'boss') {
+    e.kind = kind || type; e.name = ENEMY_NAMES[e.kind]; e.maxHp = e.hp;
+    e.isNew = !seenEnemies.has(e.kind); seenEnemies.add(e.kind); e.newT = 3.5;
+  }
   enemies.push(e);
 }
 
@@ -508,12 +559,13 @@ function explosion(x, y, color, size = 1) {
 function firePlayer() {
   const p = player, speed = -760;
   if (p.pw.spread > 0) {
-    for (const a of [-0.3, -0.15, 0, 0.15, 0.3]) bullets.push({ x: p.x, y: p.y - 16, vx: Math.sin(a) * -speed, vy: Math.cos(a) * speed, dmg: 1 });
+    const n = [1, 3, 5, 7][p.pw.spread], step = p.pw.spread === 3 ? 0.12 : 0.15;
+    for (let i = 0; i < n; i++) { const a = (i - (n - 1) / 2) * step; bullets.push({ x: p.x, y: p.y - 16, vx: Math.sin(a) * -speed, vy: Math.cos(a) * speed, dmg: 1 }); }
   } else {
     bullets.push({ x: p.x - 7, y: p.y - 14, vx: 0, vy: speed, dmg: 1 });
     bullets.push({ x: p.x + 7, y: p.y - 14, vx: 0, vy: speed, dmg: 1 });
   }
-  p.fireCd = p.pw.rapid > 0 ? 0.07 : 0.17;
+  p.fireCd = RAPID_CD[p.pw.rapid];
   Sound.shoot();
 }
 function enemyFire(x, y, angle, speed = 220, color = '#ffdd55', r = 5) {
@@ -547,7 +599,7 @@ function killEnemy(e) {
   Sound.explode(e.type === 'shooter' ? 1.5 : 1);
   dropCoins(e.x, e.y, e.coins);
   player.bomb = Math.min(1, player.bomb + 0.035);
-  if (Math.random() < 0.08 + (e.type === 'shooter' ? 0.1 : 0)) dropPower(e.x, e.y);
+  if (Math.random() < 0.06 + (e.type === 'shooter' ? 0.08 : 0)) dropPower(e.x, e.y);
 }
 
 function startBossDeath(e) {
@@ -568,7 +620,9 @@ function bossFinal(e) {
   doFlash(0.9); addShake(30); Sound.bigBoom(); vibrate([200, 60, 300]);
   dropCoins(e.x, e.y, e.coins, 420);
   dropPower(e.x - 40, e.y); dropPower(e.x + 40, e.y);
-  showBanner('BOSS DESTROYED!', '+' + pts.toLocaleString(), '#ffdd55', 2.6);
+  showBanner(e.v === 2 && e.mk === 0 && !victoryShown ? 'ALL BOSSES DEFEATED!' : 'BOSS DESTROYED!', '+' + pts.toLocaleString(), '#ffdd55', 2.6);
+  // Ending: first defeat of VOID EYE (3rd and final boss of the first cycle: THE VOID TO HELL, THE NAMELESS KING, VOID EYE)
+  if (e.v === 2 && e.mk === 0 && !victoryShown) { victoryShown = true; victoryPending = 3.0; }
   popup(e.x, e.y, '+' + pts, '#ffdd55', 30, 1.6);
   Sound.mus.boss = false;
 }
@@ -583,9 +637,10 @@ function dropCoins(x, y, n, spd = 160) {
 
 function dropPower(x, y) {
   const types = Object.keys(POWERS).filter(k => !(k === 'bomb' && player.bomb >= 1));
-  let total = 0; for (const k of types) total += POWERS[k].w;
+  const wt = k => POWERS[k].w * (k !== 'bomb' && player.pw[k] >= MAXLV ? 0.35 : 1);
+  let total = 0; for (const k of types) total += wt(k);
   let r = Math.random() * total, type = types[0];
-  for (const k of types) { r -= POWERS[k].w; if (r <= 0) { type = k; break; } }
+  for (const k of types) { r -= wt(k); if (r <= 0) { type = k; break; } }
   const isNew = !seenPowers.has(type); seenPowers.add(type);
   powerups.push({ x: clamp(x, 30, W - 30), y, type, vy: 65, t: 0, r: 15, isNew });
   if (isNew) Sound.newPower();
@@ -610,8 +665,8 @@ function triggerBomb() {
 function hurtPlayer() {
   const p = player;
   if (p.invuln > 0) return;
-  if (p.pw.shield > 0) {
-    p.pw.shield = 0; p.invuln = 1;
+  if (p.shieldUp) {
+    p.shieldUp = false; p.shieldT = SHIELD_RECHARGE[p.pw.shield]; p.invuln = 1;
     spark(p.x, p.y, '#ff66ff', 34, 300, 0.6); ring(p.x, p.y, 90, '#ff66ff', 0.4, 5);
     addShake(9); Sound.shieldBreak(); vibrate(40); return;
   }
@@ -621,7 +676,7 @@ function hurtPlayer() {
   vibrate(lives > 0 ? [80, 40, 80] : [200, 80, 300]);
   explosion(p.x, p.y, '#00f0ff', 2.2);
   doFlash(0.45, '255,60,90'); addShake(20); Sound.hurt(); hitstop = 0.12;
-  p.invuln = 2.5; p.pw.rapid = 0; p.pw.spread = 0; p.pw.laser = 0; p.pw.homing = 0;
+  p.invuln = 2.5; // power-ups are permanent for the run
   if (lives <= 0) gameOver();
 }
 
@@ -633,13 +688,65 @@ function gameOver() {
 
 function collectPower(u) {
   const p = player, def = POWERS[u.type];
-  if (u.type === 'bomb') { p.bomb = 1; Sound.bombReady(); }
-  else p.pw[u.type] = Math.max(p.pw[u.type], def.dur);
-  popup(u.x, u.y - 10, def.name + '!', def.color, 18, 1.3);
-  if (u.isNew) popup(u.x, u.y + 14, def.desc, '#ffffff', 12, 1.6);
+  if (u.type === 'bomb') { p.bomb = 1; Sound.bombReady(); popup(u.x, u.y - 10, def.name + '!', def.color, 18, 1.3); }
+  else if (p.pw[u.type] >= MAXLV) {
+    const bonus = 500 * mult; score += bonus;
+    dropCoins(u.x, u.y, 8, 200);
+    popup(u.x, u.y - 10, 'MAX! +' + bonus, def.color, 20, 1.3);
+    if (u.type === 'shield') p.shieldUp = true;
+    Sound.levelUp(4);
+  } else {
+    const lv = ++p.pw[u.type];
+    if (u.type === 'shield') { p.shieldUp = true; p.shieldT = 0; }
+    popup(u.x, u.y - 10, lv === 1 ? def.name + '!' : def.name + (lv === MAXLV ? ' MAX!' : ' LV' + lv + '!'), def.color, 18, 1.3);
+    if (lv === 1) popup(u.x, u.y + 14, def.desc, '#ffffff', 12, 1.8);
+    else Sound.levelUp(lv);
+  }
   spark(u.x, u.y, def.color, 26, 220, 0.6); ring(u.x, u.y, 60, def.color, 0.35);
   score += 100; Sound.power();
 }
+
+// =====================================================================
+//  VICTORY / ENDING
+// =====================================================================
+// Ending: pixel THE END -> short rescue -> Star Asteroid flies home & lands on Planet Star -> Star Fox climbs out -> wedding -> Star Junior -> credits
+function enterCutscene() {
+  state = 'cutscene'; cutT = 0; cutEv = {}; fireworksT = 0.3; slowmo = 0; timeScale = 1;
+  touch.active = false; Sound.laser(false); Sound.stopMusic();
+  enemies = []; eBullets = []; beams = []; missiles = []; bullets = []; powerups = []; coins = []; floaters = []; banner = null;
+  saveBeaten();
+  Sound.victory(); vibrate([100, 50, 100, 50, 300]);
+}
+function enterVictory() {
+  state = 'victory'; victoryT = 0; fireworksT = 0.2; slowmo = 0; timeScale = 1;
+  touch.active = false; Sound.laser(false); Sound.stopMusic();
+  eBullets = []; beams = [];
+  saveBeaten();
+  if (score > storedHigh) { highScore = Math.max(highScore, score); newHigh = true; saveHigh(); }
+  Sound.clear();
+  doFlash(0.6);
+}
+function keepPlaying() {
+  state = 'play'; player.invuln = 2; waveDelay = 1.5; waveCleared = true;
+  showBanner('ENDLESS MODE', 'MK II BOSSES AHEAD!', '#ff2fd6', 2.4);
+  Sound.start();
+}
+function victoryBtns() {
+  const narrow = W < 560;
+  if (narrow) {
+    const w = Math.min(320, W - 48), h = 62, x = (W - w) / 2, y2 = H - SAFE.bottom - 24 - h;
+    return { keep: { x, y: y2 - h - 14, w, h }, again: { x, y: y2, w, h } };
+  }
+  const w = 270, h = 66, y = H - SAFE.bottom - 40 - h, gap = 28;
+  return { keep: { x: W / 2 - w - gap / 2, y, w, h }, again: { x: W / 2 + gap / 2, y, w, h } };
+}
+function victoryTap(x, y) {
+  if (victoryT < VICTORY_LOCK) return;
+  const b = victoryBtns();
+  if (hitBtn(b.keep, x, y)) keepPlaying();
+  else if (hitBtn(b.again, x, y)) startGame();
+}
+function fmtTime(s) { s = Math.floor(s); return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0'); }
 
 // =====================================================================
 //  BOSS AI — three distinct bosses, enrage phase, scaling per cycle
@@ -672,7 +779,7 @@ function updateBoss(e, dt) {
 function bossAttack(e, rage) {
   const a = e.atk++ % 3, col = e.color, spdB = 1 + e.mk * 0.1;
   Sound.enemyShoot();
-  if (e.v === 0) { // WARDEN: rings, aimed fans, minions
+  if (e.v === 0) { // THE VOID TO HELL: rings, aimed fans, minions
     if (a === 0) {
       const ringFire = off => { if (e.dying || e.dead) return; const n = 16 + e.lvl * 2; for (let k = 0; k < n; k++) enemyFire(e.x, e.y, (k / n) * TAU + off, 170 * spdB, col, 6); };
       ringFire(e.t); if (rage) after(0.3, () => ringFire(e.t + 0.2));
@@ -680,9 +787,9 @@ function bossAttack(e, rage) {
       const ang = aimAt(e.x, e.y), n = rage ? 3 : 2;
       for (let k = -n; k <= n; k++) enemyFire(e.x, e.y + e.r * 0.5, ang + k * 0.15, 270 * spdB, '#ff8800', 6);
     } else {
-      const n = Math.min(2 + e.lvl, 6); for (let k = 0; k < n && enemies.length < 24; k++) spawnEnemy('drifter', clamp(e.x + rand(-70, 70), 20, W - 20), e.y);
+      const n = Math.min(2 + e.lvl, 6); for (let k = 0; k < n && enemies.length < 24; k++) spawnEnemy('drifter', clamp(e.x + rand(-70, 70), 20, W - 20), e.y, 'minion');
     }
-  } else if (e.v === 1) { // HYDRA: spiral streams, turret volleys, rain
+  } else if (e.v === 1) { // THE NAMELESS KING: spiral streams, turret volleys, rain
     if (a === 0) {
       const arms = rage ? 4 : 3;
       e.stream = { t: 2.3, every: 0.075, cd: 0, fn: () => { e.spin += 0.31; for (let k = 0; k < arms; k++) enemyFire(e.x, e.y, e.spin + k * TAU / arms, 175 * spdB, col, 5); } };
@@ -725,15 +832,44 @@ function update(rdt) {
 
   for (let i = particles.length - 1; i >= 0; i--) {
     const pt = particles[i];
-    pt.x += pt.vx * dt; pt.y += pt.vy * dt; const dr = Math.pow(0.05, dt); pt.vx *= dr; pt.vy *= dr; pt.life -= dt;
+    pt.x += pt.vx * dt; pt.y += pt.vy * dt; pt.life -= dt;
+    if (pt.fall) { pt.vy = Math.min(170, pt.vy + 50 * dt); pt.vx = Math.sin((pt.life + pt.x) * 3) * 40; } else { const dr = Math.pow(0.05, dt); pt.vx *= dr; pt.vy *= dr; }
     if (pt.life <= 0) particles.splice(i, 1);
   }
   for (let i = rings.length - 1; i >= 0; i--) { rings[i].life -= dt; if (rings[i].life <= 0) rings.splice(i, 1); }
   for (let i = floaters.length - 1; i >= 0; i--) { const f = floaters[i]; f.y -= 45 * rdt; f.life -= rdt; if (f.life <= 0) floaters.splice(i, 1); }
   if (banner) { banner.life -= rdt; if (banner.life <= 0) banner = null; }
 
+  if (state === 'cutscene') {
+    cutT += rdt;
+    if (cutT < 3.5) { fireworksT -= rdt; if (fireworksT <= 0) { fireworksT = rand(0.2, 0.4); const col = ['#ff2fd6', '#00f0ff', '#ffdd55', '#39ff14', '#ffffff'][randi(0, 4)]; const fx = rand(W * 0.1, W * 0.9), fy = rand(H * 0.08, H * 0.3); spark(fx, fy, col, 40, 280, 1.2); ring(fx, fy, 60, col, 0.5, 3); Sound.pop(); } }
+    if (cutT > 4.6 && !cutEv.pop) { cutEv.pop = true; Sound.pop(); Sound.levelUp(3); }
+    if (cutT > 6.5 && !cutEv.fly) { cutEv.fly = true; Sound.whoosh(); }
+    if (cutT > 13.5 && !cutEv.bells) { cutEv.bells = true; Sound.bells(); vibrate([40, 60, 40]); }
+    if (cutT > 14 && cutT < 19) { // confetti
+      for (let i = 0; i < (LOWFX ? 2 : 4); i++) particles.push({ x: rand(0, W), y: -5, vx: rand(-30, 30), vy: rand(60, 140), life: 6, max: 6, fall: true,
+        color: ['#ff2fd6', '#ffdd55', '#00f0ff', '#39ff14', '#ff8a1f', '#ffffff'][randi(0, 5)], size: rand(2, 4), streak: false });
+      if (particles.length > MAXP) particles.splice(0, particles.length - MAXP);
+    }
+    if (cutT > 19 && !cutEv.later) { cutEv.later = true; particles.length = 0; Sound.whoosh(); }
+    if (cutT > 23.1 && !cutEv.boop) { cutEv.boop = true; Sound.pop(); Sound.levelUp(2); vibrate(30); }
+    if (cutT > 25.7 && !cutEv.baby) { cutEv.baby = true; Sound.levelUp(5); Sound.newPower(); }
+    if (cutT >= CUT_LEN) enterVictory();
+  }
+  if (state === 'victory') {
+    victoryT += rdt; fireworksT -= rdt;
+    if (fireworksT <= 0) {
+      fireworksT = rand(0.18, 0.45);
+      const fx = rand(W * 0.1, W * 0.9), fy = rand(H * 0.08, H * 0.55);
+      const col = ['#ff2fd6', '#00f0ff', '#ffdd55', '#39ff14', '#ff9f1c', '#b04bff', '#ffffff'][randi(0, 6)];
+      spark(fx, fy, col, 46, 300, 1.3); spark(fx, fy, '#ffffff', 10, 120, 0.6, false);
+      ring(fx, fy, 70, col, 0.6, 3);
+      Sound.pop();
+    }
+  }
   if (state !== 'play') { Sound.laser(false); return; }
   const p = player;
+  playTime += rdt;
 
   // ---- timers
   for (let i = timers.length - 1; i >= 0; i--) { timers[i].t -= dt; if (timers[i].t <= 0) { const fn = timers[i].fn; timers.splice(i, 1); fn(); if (state !== 'play') return; } }
@@ -758,7 +894,7 @@ function update(rdt) {
 
   // ---- power-up timers
   p.fireCd -= dt; p.misCd -= dt; p.invuln -= dt;
-  for (const k of TIMED) p.pw[k] = Math.max(0, p.pw[k] - dt);
+  if (p.pw.shield > 0 && !p.shieldUp) { p.shieldT -= dt; if (p.shieldT <= 0) { p.shieldUp = true; popup(p.x, p.y - 36, 'SHIELD UP', '#ff66ff', 13, 0.9); Sound.shieldUp(); ring(p.x, p.y, 40, '#ff66ff', 0.35); } }
   if (p.bomb >= 1 && !p.bombAnnounced) { p.bombAnnounced = true; popup(p.x, p.y - 40, 'BOMB READY!', '#ffffff', 16, 1.2); Sound.bombReady(); }
   if (p.bomb < 1) p.bombAnnounced = false;
 
@@ -766,15 +902,17 @@ function update(rdt) {
   const firing = keys[' '] || touch.active;
   p.lasering = firing && p.pw.laser > 0;
   Sound.laser(p.lasering);
-  if (firing && !p.lasering && p.fireCd <= 0) firePlayer();
+  if (firing && p.fireCd <= 0) firePlayer();
   if (firing && p.pw.homing > 0 && p.misCd <= 0) {
-    for (const s of [-1, 1]) missiles.push({ x: p.x + s * 12, y: p.y, vx: s * 180, vy: -120, life: 3, target: null });
-    p.misCd = 0.38; Sound.missile();
+    const sides = p.pw.homing >= 2 ? [-1, 1] : [Math.random() < 0.5 ? -1 : 1];
+    for (const s of sides) missiles.push({ x: p.x + s * 12, y: p.y, vx: s * 180, vy: -120, life: 3, target: null });
+    p.misCd = [0, 0.55, 0.45, 0.32][p.pw.homing]; Sound.missile();
   }
   if (Math.random() < (LOWFX ? 0.5 : 0.85)) particles.push({ x: p.x + rand(-4, 4), y: p.y + 16, vx: rand(-20, 20), vy: rand(140, 220), life: 0.3, max: 0.3, color: '#00f0ff', size: rand(1.5, 3), streak: false });
 
-  // ---- waves
-  if (waveQueue.length === 0 && enemies.length === 0) {
+  // ---- waves (held while the ending screen is pending)
+  if (victoryPending > 0) { victoryPending -= rdt; if (victoryPending <= 0) { enterCutscene(); return; } }
+  else if (waveQueue.length === 0 && enemies.length === 0) {
     if (wave > 0 && !waveCleared) {
       waveCleared = true;
       if (wave % 5 !== 0) {
@@ -832,10 +970,10 @@ function update(rdt) {
   }
   // ---- laser beam
   if (p.lasering) {
-    const bw = 12 * SCALE + 6;
+    const bw = laserWidth(), dps = LASER_DPS[p.pw.laser];
     for (const e of enemies) {
       if (e.dead || e.dying > 0 || e.y > p.y || e.y < -e.r) continue;
-      if (Math.abs(e.x - p.x) < e.r + bw / 2) { damageEnemy(e, 24 * dt, Math.random() < 0.3 ? e.x + rand(-6, 6) : null, e.y + e.r * 0.6); }
+      if (Math.abs(e.x - p.x) < e.r + bw / 2) { damageEnemy(e, dps * dt, Math.random() < 0.3 ? e.x + rand(-6, 6) : null, e.y + e.r * 0.6); }
     }
   }
 
@@ -859,6 +997,7 @@ function update(rdt) {
   for (const e of enemies) {
     if (e.dead) continue;
     e.flash = Math.max(0, e.flash - dt); e.t += dt;
+    if (e.isNew && e.y > 20) { e.newT -= dt; if (e.newT <= 0) e.isNew = false; }
     if (e.type === 'drifter') {
       e.x += e.vx * dt; e.y += e.vy * dt;
       if (e.x < 20 || e.x > W - 20) e.vx *= -1;
@@ -887,7 +1026,7 @@ function update(rdt) {
   enemies = enemies.filter(e => !e.dead);
 
   // ---- coins
-  const magR = p.pw.magnet > 0 ? Math.max(W, H) : 75;
+  const magR = MAGNET_R[p.pw.magnet];
   coinChainT -= dt; if (coinChainT <= 0) coinChain = 0;
   for (let i = coins.length - 1; i >= 0; i--) {
     const c = coins[i];
@@ -909,7 +1048,7 @@ function update(rdt) {
   // ---- power-ups
   for (let i = powerups.length - 1; i >= 0; i--) {
     const u = powerups[i]; u.t += dt;
-    if (p.pw.magnet > 0) { const dx = p.x - u.x, dy = p.y - u.y, d = Math.hypot(dx, dy) || 1; u.x += dx / d * 260 * dt; u.y += dy / d * 260 * dt; }
+    if (p.pw.magnet >= 2) { const dx = p.x - u.x, dy = p.y - u.y, d = Math.hypot(dx, dy) || 1; u.x += dx / d * 260 * dt; u.y += dy / d * 260 * dt; }
     else u.y += u.vy * dt;
     if (u.y > H + 30) { powerups.splice(i, 1); continue; }
     if (dist2(u, p) < (u.r + p.r + 4) ** 2) { collectPower(u); powerups.splice(i, 1); }
@@ -971,13 +1110,29 @@ function drawEnemy(e) {
   ctx.restore();
 }
 
+// Name label + red health bar above each regular enemy
+function drawEnemyTag(e) {
+  if (e.type === 'boss' || e.dead || e.y < -e.r) return;
+  const bw = Math.max(30, e.r * 2.4), bx = e.x - bw / 2, by = e.y - e.r - 9;
+  ctx.shadowBlur = 0;
+  ctx.fillStyle = 'rgba(0,0,0,0.6)'; ctx.fillRect(bx - 1, by - 1, bw + 2, 5);
+  const f = clamp(e.hp / e.maxHp, 0, 1);
+  ctx.fillStyle = f > 0.5 ? '#ff3344' : f > 0.25 ? '#ff6a2a' : '#ffb000';
+  ctx.fillRect(bx, by, bw * f, 3);
+  const label = e.isNew ? 'NEW! ' + e.name : e.name, fs = e.isNew ? 10 : 8.5;
+  ctx.font = `bold ${fs}px "Courier New", monospace`;
+  const hw = ctx.measureText(label).width / 2 + 3, lx = clamp(e.x, hw, W - hw); // keep labels on-screen
+  if (e.isNew) drawText(label, lx, by - 8, fs, Math.floor(time * 6) % 2 === 0 ? '#ffdd55' : '#ffffff', 'center', 8);
+  else drawText(label, lx, by - 7, fs, e.color, 'center', 4);
+}
+
 function drawBoss(e, col, hit) {
   const r = e.r, t = e.t;
   const c = e.raged && !hit ? (Math.floor(t * 8) % 2 ? e.color : '#ffffff') : col;
   if (e.dying > 0 && Math.floor(t * 20) % 2) ctx.globalAlpha = 0.5;
   ctx.lineWidth = 3.5; glow(e.color, 34); ctx.strokeStyle = c;
   ctx.beginPath();
-  if (e.v === 0) { // WARDEN
+  if (e.v === 0) { // THE VOID TO HELL
     ctx.moveTo(0, r * 0.9); ctx.lineTo(r, r * 0.1); ctx.lineTo(r * 1.3, -r * 0.5); ctx.lineTo(r * 0.5, -r * 0.3);
     ctx.lineTo(0, -r * 0.8); ctx.lineTo(-r * 0.5, -r * 0.3); ctx.lineTo(-r * 1.3, -r * 0.5); ctx.lineTo(-r, r * 0.1); ctx.closePath();
     ctx.fill(); ctx.stroke();
@@ -985,7 +1140,7 @@ function drawBoss(e, col, hit) {
     ctx.beginPath(); for (let k = 0; k < 3; k++) { const a = k / 3 * TAU; ctx.lineTo(Math.cos(a) * r * 0.35, Math.sin(a) * r * 0.35); } ctx.closePath(); ctx.stroke();
     ctx.restore();
     ctx.beginPath(); ctx.arc(0, 0, r * 0.12 + Math.sin(t * 8) * 2, 0, TAU); ctx.fillStyle = c; ctx.fill();
-  } else if (e.v === 1) { // HYDRA
+  } else if (e.v === 1) { // THE NAMELESS KING
     ctx.moveTo(-r * 1.25, -r * 0.1); ctx.lineTo(-r * 0.6, -r * 0.7); ctx.lineTo(r * 0.6, -r * 0.7); ctx.lineTo(r * 1.25, -r * 0.1);
     ctx.lineTo(r * 0.8, r * 0.45); ctx.lineTo(0, r * 0.8); ctx.lineTo(-r * 0.8, r * 0.45); ctx.closePath(); ctx.fill(); ctx.stroke();
     for (const [a, b] of [[-0.95, 0.25], [0, 0.65], [0.95, 0.25]]) {
@@ -1066,16 +1221,22 @@ function drawHUD() {
     ctx.fillStyle = cc; ctx.fillRect(W / 2 - 30, cy + 27, 60 * clamp(comboTimer / 2.6, 0, 1), 3);
   }
   // power-up timers (bottom-left)
-  let y = H - SAFE.bottom - 20;
+  // owned permanent power-ups: icon + level pips (shield shows recharge)
   const p = player;
-  for (const k of TIMED) {
-    const v = p.pw[k]; if (v <= 0) continue;
-    const def = POWERS[k];
-    glow(def.color, 10); ctx.fillStyle = def.color;
-    ctx.fillRect(L, y - 4, 100 * Math.min(1, v / def.dur), 6);
-    ctx.strokeStyle = def.color; ctx.lineWidth = 1; ctx.strokeRect(L, y - 4, 100, 6);
-    drawText(def.name, L + 108, y, 11, def.color, 'left', 6, W * 0.4);
-    y -= 17;
+  let ix = L + 14;
+  const iy = H - SAFE.bottom - 30;
+  for (const k of PERMA) {
+    const lv = p.pw[k]; if (lv <= 0) continue;
+    const def = POWERS[k], off = k === 'shield' && !p.shieldUp;
+    ctx.globalAlpha = off ? 0.4 : 1;
+    glow(def.color, 10); ctx.strokeStyle = def.color; ctx.lineWidth = 2; ctx.fillStyle = def.color + '30';
+    ctx.beginPath(); for (let j = 0; j < 6; j++) { const a = j / 6 * TAU + Math.PI / 6; ctx.lineTo(ix + Math.cos(a) * 13, iy + Math.sin(a) * 13); } ctx.closePath(); ctx.fill(); ctx.stroke();
+    drawText(def.label, ix, iy + 1, 12, '#ffffff', 'center', 6);
+    ctx.globalAlpha = 1;
+    if (off) { ctx.strokeStyle = def.color; ctx.lineWidth = 2.5; glow(def.color, 8); ctx.beginPath(); ctx.arc(ix, iy, 17, -Math.PI / 2, -Math.PI / 2 + TAU * (1 - p.shieldT / SHIELD_RECHARGE[lv])); ctx.stroke(); }
+    ctx.shadowBlur = 0;
+    for (let j = 0; j < MAXLV; j++) { ctx.fillStyle = j < lv ? def.color : 'rgba(255,255,255,0.2)'; ctx.fillRect(ix - 9 + j * 7, iy + 18, 5, 3); }
+    ix += 34;
   }
   // bomb button (bottom-right)
   const bb = bombBtn(), ready = p.bomb >= 1;
@@ -1145,16 +1306,17 @@ function draw() {
     if (state !== 'over') for (const c of coins) { if (c.life < 2 && Math.floor(c.life * 10) % 2) continue; blit(cs, c.x, c.y, Math.abs(Math.cos(c.t)) * 0.8 + 0.2, 1); }
     if (state !== 'over') for (const u of powerups) drawPower(u);
     for (const e of enemies) drawEnemy(e);
+    for (const e of enemies) drawEnemyTag(e);
     // missiles
     glow('#ff9f1c', 12); ctx.fillStyle = '#ffe0b0';
     for (const m of missiles) { ctx.save(); ctx.translate(m.x, m.y); ctx.rotate(Math.atan2(m.vy, m.vx)); ctx.fillRect(-6, -2, 12, 4); ctx.restore(); }
     ctx.shadowBlur = 0;
     // player bullets
-    const bs = boltSprite(player.pw.spread > 0 ? '#3fb8ff' : player.pw.rapid > 0 ? '#39ff14' : '#7ff9ff');
+    const bs = boltSprite(player.pw.spread > 0 && player.pw.rapid > 0 ? '#c8a0ff' : player.pw.spread > 0 ? '#3fb8ff' : player.pw.rapid > 0 ? '#39ff14' : '#7ff9ff');
     for (const b of bullets) blit(bs, b.x, b.y);
     // laser
     if (player.lasering) {
-      const p = player, bw = (12 * SCALE + 6) * (0.85 + 0.3 * Math.random());
+      const p = player, bw = laserWidth() * (0.85 + 0.3 * Math.random());
       const lg = ctx.createLinearGradient(p.x - bw, 0, p.x + bw, 0);
       lg.addColorStop(0, 'rgba(255,42,109,0)'); lg.addColorStop(0.3, 'rgba(255,42,109,0.85)'); lg.addColorStop(0.5, '#ffffff');
       lg.addColorStop(0.7, 'rgba(255,42,109,0.85)'); lg.addColorStop(1, 'rgba(255,42,109,0)');
@@ -1183,15 +1345,18 @@ function draw() {
   }
   ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over'; ctx.lineCap = 'butt';
 
-  if (state !== 'title' && player && state !== 'over') {
+  if (state !== 'title' && player && state !== 'over' && state !== 'cutscene') {
     const p = player;
     const blink = p.invuln > 0 && Math.floor(time * 15) % 2 === 0;
     drawShip(p.x, p.y, p.tilt, blink ? 0.3 : 1);
-    if (p.pw.shield > 0 && !(p.pw.shield < 2 && Math.floor(time * 10) % 2 === 0)) {
+    if (p.shieldUp) {
       glow('#ff66ff', 25); ctx.strokeStyle = '#ff66ff'; ctx.lineWidth = 2;
       ctx.beginPath(); ctx.arc(p.x, p.y, 28 * SCALE + Math.sin(time * 8) * 2, 0, TAU); ctx.stroke();
+    } else if (p.pw.shield > 0) {
+      ctx.shadowBlur = 0; ctx.strokeStyle = 'rgba(255,102,255,0.35)'; ctx.lineWidth = 1.5;
+      ctx.beginPath(); ctx.arc(p.x, p.y, 28 * SCALE, -Math.PI / 2, -Math.PI / 2 + TAU * (1 - p.shieldT / SHIELD_RECHARGE[p.pw.shield])); ctx.stroke();
     }
-    if (p.pw.magnet > 0) { ctx.shadowBlur = 0; ctx.strokeStyle = 'rgba(255,230,0,0.25)'; ctx.lineWidth = 1; ctx.beginPath(); ctx.arc(p.x, p.y, 40 + (time * 60) % 30, 0, TAU); ctx.stroke(); }
+    if (p.pw.magnet > 0 && state === 'play') { ctx.shadowBlur = 0; ctx.strokeStyle = 'rgba(255,230,0,0.25)'; ctx.lineWidth = 1; ctx.beginPath(); ctx.arc(p.x, p.y, 40 + (time * 60) % 30, 0, TAU); ctx.stroke(); }
   }
   // floaters (scale pop)
   for (const f of floaters) {
@@ -1212,9 +1377,10 @@ function draw() {
   const big = Math.max(40, 72 * SCALE), mid = Math.max(18, 24 * SCALE), small = Math.max(12, 15 * SCALE), FW = W * 0.9;
   if (state === 'title') {
     const pulse = 0.5 + 0.5 * Math.sin(time * 4);
+    if (beaten) drawTrophy(W / 2, H * 0.22 - big * 0.95);
     drawText('STAR', W / 2, H * 0.22, big, '#00f0ff', 'center', 40, FW);
     drawText('SHOOTER', W / 2, H * 0.22 + big, big, '#ff2fd6', 'center', 40, FW);
-    drawText('COMBOS • COINS • 7 POWER-UPS • BOSSES', W / 2, H * 0.22 + big * 1.75, small, '#ffdd55', 'center', 10, FW);
+    drawText('STACKING POWER-UPS • COMBOS • 3 BOSSES', W / 2, H * 0.22 + big * 1.75, small, '#ffdd55', 'center', 10, FW);
     // power-up showcase
     const keysP = Object.keys(POWERS), gap = Math.min(46, (W * 0.85) / keysP.length);
     keysP.forEach((k, i) => {
@@ -1224,6 +1390,7 @@ function draw() {
       drawText(d.label, x, y + 1, 13, '#ffffff', 'center', 8);
     });
     drawShip(W / 2, H * 0.58 + Math.sin(time * 2) * 8, Math.sin(time), 1);
+    drawText('PILOT THE STAR ASTEROID', W / 2, H * 0.58 + 40 * SCALE, Math.max(12, 15 * SCALE), '#00f0ff', 'center', 12, FW);
     ctx.globalAlpha = 0.4 + 0.6 * pulse;
     drawText(isTouch ? 'TAP TO START' : 'PRESS SPACE TO START', W / 2, H * 0.68, mid * (isTouch ? 1.3 : 1), '#ffffff', 'center', 20, FW);
     ctx.globalAlpha = 1;
@@ -1235,6 +1402,10 @@ function draw() {
       drawText('PAUSE: P   MUTE: M   MUSIC: N', W / 2, H * 0.76 + small * 1.6, small, '#8ab4ff', 'center', 8, FW);
     }
     drawText(`HIGH SCORE ${highScore}`, W / 2, H - SAFE.bottom - Math.max(30, H * 0.08), mid, '#ffdd55', 'center', 14, FW);
+  } else if (state === 'cutscene') {
+    drawCutscene();
+  } else if (state === 'victory') {
+    drawVictory();
   } else if (state === 'paused') {
     ctx.shadowBlur = 0; ctx.fillStyle = 'rgba(5,1,15,0.6)'; ctx.fillRect(0, 0, W, H);
     drawText('PAUSED', W / 2, H * 0.45, big, '#00f0ff', 'center', 30, FW);
@@ -1253,6 +1424,330 @@ function draw() {
     }
   }
   ctx.shadowBlur = 0;
+}
+
+// =====================================================================
+//  PIXEL-ART CUTSCENE
+// =====================================================================
+const PAL = {
+  o: '#ff8a1f', d: '#c85a0a', w: '#fff4e0', k: '#1a1020', j: '#2a6cff', J: '#1a3f9a', s: '#ff2a4a', g: '#7ff9ff',
+  r: '#d9482b', R: '#8f2412', c: '#ffd23f', p: '#ff2fd6', v: '#ff6fb5', V: '#c23b86',
+  G: '#39ff14', D: '#1f9a0a', u: '#b04bff', h: '#ff2f6d', y: '#ffd23f', b: '#8ab4ff'
+};
+const FOX_HEAD = ['k..........k', 'dk........kd', 'dok......kod', 'oooooooooooo', 'ogggoooogggo', 'oooooooooooo', 'ookooooookoo', 'oowwwwwwwwoo', 'owwwwkkwwwwo', '.owwwwwwwwo.'];
+const STARFOX_BODY = ['..sssssssss.', '.jjjjwwjjjs.', '.jJjjwwjjJs.', 'ojjjjwwjjjjo', 'ojjjjwwjjjjo', '.JJJJJJJJJJ.', '.jjj....jjj.', '.kkk....kkk.'];
+const PRINCESS_HEAD = ['R...cpcc...R', 'rR..cccc..Rr', 'rrR......Rrr', 'rrrrrrrrrrrr', 'rrrrrrrrrrrr', 'rkkrrrrrrkkr', 'rrrwwwwwwrrr', 'rwwwwkkwwwwr', '.rwwwwwwwwr.'];
+const PRINCESS_BODY = ['...vvvvvv...', '..vvpvvpvv..', '.vvvvvvvvvv.', 'rvvvvvvvvvvr', '.vVvvvvvvVv.', 'vvvvvvvvvvvv', 'vVvvVvvVvvVv', 'vvvvvvvvvvvv', '..kk....kk..'];
+const FOX_TAIL = ['...oo.', '..oooo', '.ooooo', '.oooow', 'oooow.', 'ooowww', 'oowww.', '.ww...'];
+const RED_TAIL = ['..rr....', '.rrrr...', 'rrrrrr..', 'rrrrrrr.', 'rrrrrrrw', '.rrrrrww', '..rrrwww', '...rwww.', '....ww..'];
+const CROWD = [
+  ['k......k', 'ok....ko', 'oooooooo', 'okooooko', 'owwkkwwo', '.owwwwo.', '.oooooo.', '.k....k.'],
+  ['k......k', '.G....G.', '..GGGG..', '.GGGGGG.', 'GwkGGwkG', 'GGGGGGGG', 'GGDGGDGG', '.G.GG.G.'],
+  ['.u....u.', '.u....u.', '.uu..uu.', '.uuuuuu.', 'uwkuuwku', 'uuuppuuu', '.uuuuuu.', '..u..u..'],
+  ['R......R', 'rR....Rr', 'rrrrrrrr', 'rkrrrrkr', 'rwwkkwwr', '.rwwwwr.', '.rrrrrr.', '.k....k.'],
+  ['..bbbb..', '.bbbbbb.', 'bwkbbwkb', 'bbbbbbbb', 'bbyyyybb', '.bbbbbb.', '.b.bb.b.', 'b..bb..b']
+];
+const JUNIOR_SPR = ['k.....k..', 'ok...ko..', 'ooooooo..', 'okoooko.r', 'owwkwwo.r', '.owwwo.rr', '.ooooorr.', '.k...k...'];
+const HEART = ['.hh.hh.', 'hhhhhhh', 'hhhhhhh', '.hhhhh.', '..hhh..', '...h...'];
+function composeSprite(parts) { // parts: [{rows, x, y}] -> rows
+  let w = 0, h = 0;
+  for (const p of parts) { w = Math.max(w, p.x + p.rows[0].length); h = Math.max(h, p.y + p.rows.length); }
+  const g = Array.from({ length: h }, () => Array(w).fill('.'));
+  for (const p of parts) p.rows.forEach((row, yy) => [...row].forEach((ch, xx) => { if (ch !== '.') g[p.y + yy][p.x + xx] = ch; }));
+  return g.map(r => r.join(''));
+}
+const STARFOX_SPR = composeSprite([{ rows: FOX_TAIL.map(r => [...r].reverse().join('')), x: 0, y: 9 }, { rows: FOX_HEAD, x: 5, y: 0 }, { rows: STARFOX_BODY, x: 5, y: 10 }]);
+const PRINCESS_SPR = composeSprite([{ rows: PRINCESS_HEAD, x: 0, y: 0 }, { rows: PRINCESS_BODY, x: 0, y: 9 }, { rows: RED_TAIL, x: 10, y: 8 }]);
+const pixCache = {};
+function pixCanvas(key, rows) {
+  if (pixCache[key]) return pixCache[key];
+  const c = document.createElement('canvas'); c.width = rows[0].length; c.height = rows.length;
+  const g = c.getContext('2d');
+  rows.forEach((row, y) => [...row].forEach((ch, x) => { if (PAL[ch]) { g.fillStyle = PAL[ch]; g.fillRect(x, y, 1, 1); } }));
+  return (pixCache[key] = c);
+}
+function drawPix(key, rows, cx, bottom, px, alpha = 1) {
+  const c = pixCanvas(key, rows), w = c.width * px, h = c.height * px;
+  ctx.save(); ctx.globalAlpha = alpha; ctx.imageSmoothingEnabled = false; ctx.shadowBlur = 0;
+  ctx.drawImage(c, Math.round(cx - w / 2), Math.round(bottom - h), w, h);
+  ctx.restore();
+  return h;
+}
+function caption(text, y, color = '#ffffff', size) {
+  drawText(text, W / 2, y, size || Math.max(16, 22 * SCALE), color, 'center', 14, W * 0.9);
+}
+function nameTag(text, x, y, color) {
+  ctx.font = `bold ${Math.max(13, 16 * SCALE)}px "Courier New", monospace`;
+  const hw = ctx.measureText(text).width / 2 + 8;
+  drawText(text, clamp(x, hw, W - hw), y, Math.max(13, 16 * SCALE), color, 'center', 14);
+}
+function drawPlanet(x, y, r) {
+  ctx.save(); ctx.shadowBlur = 0;
+  const g = ctx.createRadialGradient(x - r * 0.35, y - r * 0.35, r * 0.1, x, y, r);
+  g.addColorStop(0, '#ffe9a0'); g.addColorStop(0.45, '#ffb347'); g.addColorStop(1, '#b8326b');
+  glow('#ffb347', 40); ctx.fillStyle = g; ctx.beginPath(); ctx.arc(x, y, r, 0, TAU); ctx.fill();
+  ctx.shadowBlur = 0; ctx.strokeStyle = 'rgba(255,240,180,0.7)'; ctx.lineWidth = Math.max(2, r * 0.05);
+  ctx.beginPath(); ctx.ellipse(x, y, r * 1.6, r * 0.38, -0.25, 0, TAU); ctx.stroke();
+  ctx.restore();
+  drawStar(x + r * 0.2, y - r * 0.15, r * 0.22, '#fff6c2');
+}
+// ---- chunky 5x7 bitmap font for the pixel "THE END" ----
+const FONT5x7 = {
+  T: ['11111', '00100', '00100', '00100', '00100', '00100', '00100'],
+  H: ['10001', '10001', '10001', '11111', '10001', '10001', '10001'],
+  E: ['11111', '10000', '10000', '11110', '10000', '10000', '11111'],
+  N: ['10001', '11001', '10101', '10011', '10001', '10001', '10001'],
+  D: ['11110', '10001', '10001', '10001', '10001', '10001', '11110'],
+  A: ['01110', '10001', '10001', '11111', '10001', '10001', '10001'],
+  F: ['11111', '10000', '10000', '11110', '10000', '10000', '10000'],
+  W: ['10001', '10001', '10001', '10101', '10101', '10101', '01010'],
+  Y: ['10001', '10001', '01010', '00100', '00100', '00100', '00100'],
+  R: ['11110', '10001', '10001', '11110', '10100', '10010', '10001'],
+  S: ['01111', '10000', '10000', '01110', '00001', '00001', '11110'],
+  L: ['10000', '10000', '10000', '10000', '10000', '10000', '11111'],
+  '.': ['00000', '00000', '00000', '00000', '00000', '01100', '01100'],
+  ' ': ['00000', '00000', '00000', '00000', '00000', '00000', '00000']
+};
+function pixelTextCanvas(text, cell, color) {
+  const key = 'pt' + text + cell + color;
+  if (pixCache[key]) return pixCache[key];
+  const cols = text.length * 6 - 1, pad = cell * 3, c = document.createElement('canvas');
+  c.width = cols * cell + pad * 2; c.height = 7 * cell + pad * 2;
+  const g = c.getContext('2d');
+  const each = (fn) => [...text].forEach((ch, i) => (FONT5x7[ch] || FONT5x7[' ']).forEach((row, y) => [...row].forEach((b, x) => { if (b === '1') fn(pad + (i * 6 + x) * cell, pad + y * cell); })));
+  g.fillStyle = '#3a0a3a'; each((x, y) => g.fillRect(x + cell * 0.35, y + cell * 0.35, cell, cell));      // chunky drop shadow
+  g.shadowColor = '#ff2fd6'; g.shadowBlur = cell * 2.2; g.fillStyle = color; each((x, y) => g.fillRect(x, y, cell - 1, cell - 1)); // neon glow
+  g.shadowBlur = 0; g.fillStyle = 'rgba(255,255,255,0.55)'; each((x, y) => g.fillRect(x + 1, y + 1, Math.max(1, cell * 0.3), Math.max(1, cell * 0.3))); // pixel shine
+  return (pixCache[key] = c);
+}
+function drawPixelText(text, cx, cy, maxW, color = '#ffdd55', scale = 1) {
+  const cols = text.length * 6 - 1, cell = Math.max(3, Math.floor(Math.min(maxW / cols, 16)));
+  const c = pixelTextCanvas(text, cell, color), w = c.width * scale, h = c.height * scale;
+  ctx.save(); ctx.imageSmoothingEnabled = false; ctx.shadowBlur = 0;
+  ctx.drawImage(c, Math.round(cx - w / 2), Math.round(cy - h / 2), w, h); ctx.restore();
+}
+function drawGround(base) {
+  ctx.shadowBlur = 0;
+  const hg = ctx.createLinearGradient(0, base, 0, H); hg.addColorStop(0, '#5a1a52'); hg.addColorStop(1, '#1a0620');
+  ctx.fillStyle = hg; ctx.beginPath(); ctx.moveTo(0, base + 4); ctx.quadraticCurveTo(W / 2, base - 26, W, base + 4); ctx.lineTo(W, H); ctx.lineTo(0, H); ctx.fill();
+  glow('#ffb347', 14); ctx.strokeStyle = '#ffb347'; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(0, base + 4); ctx.quadraticCurveTo(W / 2, base - 26, W, base + 4); ctx.stroke();
+  ctx.shadowBlur = 0;
+}
+function drawBigShip(x, y, sc, tilt = 0, flame = true) {
+  ctx.save(); ctx.translate(x, y); ctx.scale(sc, sc); drawShip(0, 0, tilt, flame ? 1 : 0.999); ctx.restore();
+}
+// Timeline (seconds): 0 THE END (pixel) | 3.5 rescue | 6.5 fly home | 9.5 land + Star Fox climbs out | 13.5 wedding | 19 A FEW YEARS LATER... | 21.5 kiss | 25.5 Star Junior
+function drawCutscene() {
+  const t = cutT, px = clamp(Math.floor(Math.min(W / 70, H / 110)), 3, 8);
+  const base = H * 0.6, capY = H * 0.8, topY = SAFE.top + H * 0.12;
+  ctx.shadowBlur = 0; ctx.fillStyle = `rgba(5,1,15,${0.5 * clamp(t / 0.6, 0, 1)})`; ctx.fillRect(0, 0, W, H);
+  const sfH = STARFOX_SPR.length * px, prH = PRINCESS_SPR.length * px;
+  const shipSc = Math.max(1.6, px * 0.42);
+  if (t < 3.5) { // --- THE END (chunky pixel letters)
+    const k = clamp(t / 0.5, 0, 1), pop = Math.max(0.2, 1 + 2.2 * Math.pow(k - 1, 3) + 1.2 * Math.pow(k - 1, 2));
+    drawPixelText('THE END', W / 2, H * 0.42, W * 0.9, '#ffdd55', pop * (1 + 0.03 * Math.sin(t * 6)));
+    if (t > 0.8) caption('ALL BOSSES DEFEATED!', H * 0.42 + Math.min(W * 0.9 / 41, 16) * 6, '#00f0ff', Math.max(14, 20 * SCALE));
+  } else if (t < 6.5) { // --- short rescue
+    const s = t - 3.5, fx = W * 0.27, prx = W * 0.73;
+    drawBigShip(fx - 2, base - sfH - 40 * shipSc * 0.5, shipSc * 0.6, 0);
+    drawPix('starfox', STARFOX_SPR, fx, base, px);
+    nameTag('STAR FOX', fx, base + 18, '#ff8a1f');
+    const drop = clamp(s / 1.0, 0, 1), py = base - (1 - drop) * H * 0.45;
+    drawPix('princess', PRINCESS_SPR, prx, py, px);
+    if (s < 1.1) {
+      glow('#ff2fd6', 20); ctx.strokeStyle = '#ff2fd6'; ctx.lineWidth = 3; ctx.fillStyle = 'rgba(255,47,214,0.12)';
+      ctx.beginPath(); ctx.arc(prx, py - prH / 2, prH * 0.75 + Math.sin(t * 10) * 3, 0, TAU); ctx.fill(); ctx.stroke(); ctx.shadowBlur = 0;
+      caption('THE PRINCESS IS TRAPPED!', capY, '#ff6fb5');
+    } else {
+      if (!cutEv.burst) { cutEv.burst = true; spark(prx, py - prH / 2, '#ff2fd6', 40, 260, 0.9); ring(prx, py - prH / 2, prH, '#ff2fd6', 0.5, 4); }
+      nameTag('PRINCESS RED TAIL', prx, base + 18, '#ff4a3a');
+      caption('MY HERO, STAR FOX!', capY, '#ff6fb5');
+      for (let i = 0; i < 3; i++) { const hk = ((s * 0.6 + i / 3) % 1); drawPix('heart', HEART, W / 2 + Math.sin((s + i) * 3) * 14, base - sfH * 0.4 - hk * H * 0.25, Math.max(2, px - 1), 1 - hk); }
+    }
+  } else if (t < 9.5) { // --- the Star Asteroid flies home to Planet Star
+    const s = t - 6.5, k = s / 3;
+    const pr = Math.min(W, H) * (0.08 + 0.55 * k * k);
+    drawPlanet(W / 2, H * 0.4, pr);
+    if (s > 0.4) nameTag('PLANET STAR', W / 2, H * 0.4 - pr - 20, '#ffdd55');
+    const shipY = H * 0.74 - k * H * 0.28, sc = 1.6 - k * 1.2;
+    drawBigShip(W / 2, shipY, sc, Math.sin(t * 3) * 0.3);
+    for (let i = 0; i < 3; i++) particles.push({ x: W / 2 + rand(-6, 6) * sc, y: shipY + 18 * sc, vx: rand(-20, 20), vy: rand(80, 160), life: 0.4, max: 0.4, color: i ? '#00f0ff' : '#ff8a1f', size: 3, streak: false });
+    if (sc > 0.7) nameTag('STAR ASTEROID', W / 2, shipY + 34 * sc + 8, '#00f0ff');
+    caption('RETURNING TO PLANET STAR...', capY + 20 * SCALE, '#00f0ff');
+  } else if (t < 13.5) { // --- landing on Planet Star, Star Fox climbs out
+    const s = t - 9.5;
+    drawGround(base);
+    drawText('WELCOME HOME TO PLANET STAR', W / 2, topY, Math.max(15, 22 * SCALE), '#ffdd55', 'center', 16, W * 0.92);
+    const sx = W * 0.3, landY = base - 22 * shipSc, k = clamp(s / 1.5, 0, 1);
+    const shipY = -60 + (landY + 60) * (1 - Math.pow(1 - k, 2));
+    if (k < 1) for (let i = 0; i < 3; i++) particles.push({ x: sx + rand(-8, 8), y: shipY + 18 * shipSc, vx: rand(-30, 30), vy: rand(100, 200), life: 0.35, max: 0.35, color: i ? '#00f0ff' : '#ff8a1f', size: 3, streak: false });
+    if (k >= 1 && !cutEv.landed) { cutEv.landed = true; Sound.explode(0.6); addShake(6); spark(sx, base, '#ffb347', 30, 200, 0.7, false); ring(sx, base, 70, '#ffb347', 0.4, 3); }
+    // Star Fox climbs out of the cockpit (rises from the ship, then hops down beside it)
+    if (s > 1.9) {
+      const c = clamp((s - 1.9) / 0.8, 0, 1), h2 = clamp((s - 2.7) / 0.5, 0, 1);
+      const fx = sx + h2 * (W * 0.28), fy = (shipY - 4 * shipSc) - c * sfH * 0.55 + h2 * (base - (shipY - 4 * shipSc) + sfH * 0.55) - Math.sin(h2 * Math.PI) * 30;
+      if (c < 1 && h2 === 0) { ctx.save(); ctx.beginPath(); ctx.rect(0, 0, W, shipY - 4 * shipSc); ctx.clip(); drawPix('starfox', STARFOX_SPR, fx, fy, px); ctx.restore(); }
+      else drawPix('starfox', STARFOX_SPR, fx, fy, px);
+      if (h2 >= 1) nameTag('STAR FOX', fx, base + 18, '#ff8a1f');
+      if (s > 2.0 && s < 2.8) caption('STAR FOX CLIMBS OUT!', capY, '#ff8a1f');
+    }
+    drawBigShip(sx, shipY, shipSc, 0, k < 1);
+    if (k >= 1) nameTag('STAR ASTEROID', sx, base + 18, '#00f0ff');
+    if (s > 3.0) { // princess steps out to greet him
+      const pk = clamp((s - 3.0) / 0.6, 0, 1);
+      drawPix('princess', PRINCESS_SPR, W * 0.86, base, px, pk);
+      if (pk >= 1) nameTag('PRINCESS RED TAIL', W * 0.82, base + 40 * Math.max(1, SCALE), '#ff4a3a');
+    }
+    if (k >= 1 && s < 1.9) caption('TOUCHDOWN!', capY, '#39ff14');
+  } else if (t < 19) { // --- the royal wedding
+    const s = t - 13.5;
+    drawGround(base);
+    drawText('WELCOME HOME TO PLANET STAR', W / 2, topY, Math.max(15, 22 * SCALE), '#ffdd55', 'center', 16, W * 0.92);
+    drawBigShip(W * 0.1, base - 14 * shipSc * 0.5, shipSc * 0.5, 0, false); // parked Star Asteroid
+    const archR = Math.min(W * 0.36, sfH * 1.35), ay = base - 6;
+    glow('#ff2fd6', 22); ctx.strokeStyle = '#ff2fd6'; ctx.lineWidth = 4;
+    ctx.beginPath(); ctx.arc(W / 2, ay, archR, Math.PI, 0); ctx.stroke(); ctx.shadowBlur = 0;
+    for (let i = 0; i <= 6; i++) { const a = Math.PI + i / 6 * Math.PI; drawPix('heart', HEART, W / 2 + Math.cos(a) * archR, ay + Math.sin(a) * archR + 9, Math.max(2, px - 2)); }
+    const k = clamp(s / 1.6, 0, 1), gap = (W * 0.32) * (1 - k) + px * 9.5;
+    const hop = s > 1.8 ? Math.abs(Math.sin(s * 4)) * px * 1.5 : 0;
+    drawPix('starfox', STARFOX_SPR, W / 2 - gap, ay - hop, px);
+    drawPix('princess', PRINCESS_SPR, W / 2 + gap, ay - hop, px);
+    if (s > 1.6) drawPix('heart', HEART, W / 2, ay - sfH - 8 - Math.sin(s * 5) * 4, px);
+    const cpx = Math.max(3, px - 1), n = Math.max(5, Math.floor(W / (11 * cpx)));
+    for (let i = 0; i < n; i++) {
+      const cx = (i + 0.5) * (W / n), jump = Math.abs(Math.sin(s * 6 + i * 1.7)) * cpx * 3;
+      drawPix('crowd' + (i % CROWD.length), CROWD[i % CROWD.length], cx, H * 0.86 - jump + (i % 2) * cpx * 3, cpx);
+    }
+    if (s > 2) drawText('STAR FOX ♥ PRINCESS RED TAIL', W / 2, (base + H * 0.86 - 8 * cpx) / 2, Math.max(15, 24 * SCALE), `hsl(${(time * 120) % 360},100%,70%)`, 'center', 18, W * 0.94);
+    if (s > 1.2) caption('JUST MARRIED!', topY + 34 * SCALE, '#ff6fb5', Math.max(14, 18 * SCALE));
+    if (s > 2.6) caption('THANK YOU FOR PROTECTING SPACE!', H * 0.94 - SAFE.bottom, '#00f0ff', Math.max(13, 17 * SCALE));
+  } else if (t < 21.5) { // --- title card
+    const s = t - 19, a = clamp(s / 0.4, 0, 1) * clamp((2.5 - s) / 0.4, 0, 1);
+    ctx.fillStyle = '#05010f'; ctx.fillRect(0, 0, W, H);
+    ctx.globalAlpha = a;
+    drawPixelText('A FEW YEARS', W / 2, H * 0.43, W * 0.86, '#ff6fb5', 1);
+    drawPixelText('LATER...', W / 2, H * 0.43 + Math.min(W * 0.86 / 59, 14) * 10, W * 0.62, '#ff6fb5', 1);
+    ctx.globalAlpha = 1;
+  } else if (t < 25.5) { // --- sweet nose-boop kiss
+    const s = t - 21.5;
+    drawGround(base);
+    drawText('PLANET STAR', W / 2, topY, Math.max(15, 22 * SCALE), '#ffdd55', 'center', 16, W * 0.92);
+    // little glowing moon + stars for a cozy evening
+    drawStar(W * 0.8, topY + 50 * SCALE, 10, '#ffdd55'); drawStar(W * 0.18, topY + 80 * SCALE, 7, '#00f0ff');
+    const k = clamp((s - 0.3) / 1.3, 0, 1), ease = 1 - Math.pow(1 - k, 3);
+    const gap = (W * 0.3) * (1 - ease) + px * 8;
+    const tip = s > 1.6 && s < 3.4 ? px : 0;
+    drawPix('starfox', STARFOX_SPR, W / 2 - gap + tip, base, px);
+    drawPix('princess', PRINCESS_SPR, W / 2 + gap - tip, base, px);
+    nameTag('STAR FOX', W / 2 - Math.max(gap, px * 12), base + 18, '#ff8a1f');
+    nameTag('PRINCESS RED TAIL', W / 2 + Math.max(gap, px * 12), base + 40 * Math.max(1, SCALE), '#ff4a3a');
+    const noseY = base - sfH * 0.62;
+    if (s > 1.6) {
+      if (!cutEv.boopFx) { cutEv.boopFx = true; spark(W / 2, noseY, '#ff6fb5', 30, 160, 0.7, false); ring(W / 2, noseY, 40, '#ff2fd6', 0.4, 3); }
+      const bp = clamp((s - 1.6) / 0.25, 0, 1);
+      drawPix('heart', HEART, W / 2, base - sfH - px - Math.sin(s * 6) * 3, Math.max(2, px) * (0.6 + 0.6 * bp), bp);
+      for (let i = 0; i < 6; i++) { const hk = (s * 0.45 + i / 6) % 1; drawPix('heart', HEART, W / 2 + Math.sin((s + i) * 2.2) * (30 + i * 6), base - sfH - px * 2 - hk * H * 0.3, Math.max(2, px - 2), 1 - hk); }
+      caption('BOOP!', base - sfH - px * 10 - 14, '#ff6fb5', Math.max(16, 24 * SCALE));
+      if (s > 2.0) caption('TRUE LOVE ON PLANET STAR', capY, '#ff6fb5');
+    }
+  } else { // --- Star Junior
+    const s = t - 25.5;
+    drawGround(base);
+    const fx = W * 0.24, prx = W * 0.76;
+    drawPix('starfox', STARFOX_SPR, fx, base, px);
+    drawPix('princess', PRINCESS_SPR, prx, base, px);
+    nameTag('STAR FOX', fx, base + 18, '#ff8a1f');
+    nameTag('PRINCESS RED TAIL', prx, base + 18, '#ff4a3a');
+    const ap = clamp(s / 0.6, 0, 1), jpx = Math.max(3, px), hop = Math.abs(Math.sin(s * 5)) * jpx * 2;
+    if (s > 0.1 && !cutEv.kitFx) { cutEv.kitFx = true; spark(W / 2, base - 20, '#ffdd55', 36, 200, 0.8); ring(W / 2, base - 20, 60, '#ffdd55', 0.5); }
+    const kh = drawPix('junior', JUNIOR_SPR, W / 2, base - hop, jpx * ap + 0.01, ap);
+    if (s > 0.6) nameTag('STAR JUNIOR', W / 2, base + 50 * Math.max(1, SCALE), '#ffb347');
+    for (let i = 0; i < 4; i++) { const hk = (s * 0.5 + i / 4) % 1; drawPix('heart', HEART, W / 2 + Math.sin((s + i) * 2.5) * 30, base - kh - 10 - hk * H * 0.22, Math.max(2, px - 2), (1 - hk) * ap); }
+    if (s > 1.0) {
+      const fs = Math.max(12, 15 * SCALE), lines = ['I HOPE YOU GROW UP', 'TO BE A FOX', 'JUST LIKE ME!'];
+      ctx.font = `bold ${fs}px "Courier New", monospace`;
+      const bw = Math.min(W * 0.86, Math.max(...lines.map(l => ctx.measureText(l).width)) + 28), bh = lines.length * fs * 1.3 + 20;
+      const bx = clamp(fx - bw * 0.2, 8 + SAFE.left, W - bw - 8 - SAFE.right), by = base - sfH - bh - 30;
+      ctx.globalAlpha = clamp((s - 1.0) / 0.3, 0, 1);
+      ctx.shadowBlur = 0; ctx.fillStyle = '#ffffff'; rrect(bx, by, bw, bh, 12); ctx.fill();
+      ctx.beginPath(); ctx.moveTo(fx - 8, by + bh - 1); ctx.lineTo(fx + 10, by + bh - 1); ctx.lineTo(fx - 2, by + bh + 18); ctx.closePath(); ctx.fill();
+      ctx.fillStyle = '#1a1020'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      lines.forEach((l, i) => ctx.fillText(l, bx + bw / 2, by + 10 + fs * 0.65 + i * fs * 1.3));
+      ctx.globalAlpha = 1;
+    }
+    if (s > 3.4) drawPixelText('THE END', W / 2, capY + 20 * SCALE, W * 0.7, '#ffdd55', clamp((s - 3.4) / 0.3, 0.2, 1));
+  }
+  if (t > CUT_SKIP) drawText(isTouch ? 'TAP TO SKIP' : 'SPACE TO SKIP', W - SAFE.right - 12, H - SAFE.bottom - 14, 11, 'rgba(200,220,255,0.6)', 'right', 0);
+}
+
+function drawStar(x, y, r, color) {
+  glow(color, 18); ctx.fillStyle = color;
+  ctx.beginPath();
+  for (let i = 0; i < 10; i++) { const a = -Math.PI / 2 + i * Math.PI / 5, rr = i % 2 ? r * 0.45 : r; ctx.lineTo(x + Math.cos(a) * rr, y + Math.sin(a) * rr); }
+  ctx.closePath(); ctx.fill();
+}
+function drawTrophy(x, y) {
+  const s = 1 + 0.08 * Math.sin(time * 4);
+  drawStar(x - 70, y, 11 * s, '#ffdd55');
+  drawStar(x + 70, y, 11 * s, '#ffdd55');
+  drawText('GALAXY SAVED', x, y + 1, 14, '#ffdd55', 'center', 12);
+}
+function drawButton(r, label, color, alpha) {
+  ctx.globalAlpha = alpha;
+  const pulse = 0.5 + 0.5 * Math.sin(time * 5);
+  ctx.fillStyle = color + '22'; glow(color, 14 + pulse * 10); ctx.strokeStyle = color; ctx.lineWidth = 3;
+  rrect(r.x, r.y, r.w, r.h, 14); ctx.fill(); ctx.stroke();
+  drawText(label, r.x + r.w / 2, r.y + r.h / 2 + 1, Math.min(26, r.h * 0.38), '#ffffff', 'center', 12, r.w - 20);
+  ctx.globalAlpha = 1;
+}
+const CREDITS = [
+  ['STAR SHOOTER', '#00f0ff', 1.3], ['', '', 1], ['Made by Ellie', '#ff2fd6', 1.2], ['Produced by ELLIE', '#ff2fd6', 1.2], ['', '', 1],
+  ['STARRING', '#8ab4ff', 0.8], ['STAR FOX', '#ff8a1f', 1.15], ['PRINCESS RED TAIL', '#ff4a3a', 1.15], ['STAR JUNIOR', '#ffb347', 1.15], ['AND THE SHIP', '#8ab4ff', 0.8], ['STAR ASTEROID', '#00f0ff', 1.15], ['', '', 1],
+  ['FROM', '#8ab4ff', 0.8], ['PLANET STAR', '#ffdd55', 1], ['', '', 1],
+  ['BOSSES DEFEATED', '#8ab4ff', 0.8], ['THE VOID TO HELL', '#ff3355', 1], ['THE NAMELESS KING', '#7dff3a', 1], ['VOID EYE', '#b04bff', 1], ['', '', 1],
+  ['MUSIC & SOUND', '#8ab4ff', 0.8], ['100% WEB AUDIO', '#ffdd55', 1], ['', '', 1], ['THANKS FOR PLAYING!', '#ffffff', 1.1], ['', '', 1], ['', '', 1]
+];
+function drawVictory() {
+  const t = victoryT, FW = W * 0.9;
+  ctx.shadowBlur = 0; ctx.fillStyle = `rgba(5,1,15,${0.6 * clamp(t / 0.8, 0, 1)})`; ctx.fillRect(0, 0, W, H);
+  const big = Math.max(46, 84 * SCALE), mid = Math.max(18, 24 * SCALE);
+  const inT = Math.min(1, t / 0.5), pop = Math.max(0.2, 1 + 2.2 * Math.pow(inT - 1, 3) + 1.2 * Math.pow(inT - 1, 2));
+  const y0 = SAFE.top + H * 0.13;
+  drawText('YOU WIN!', W / 2, y0, big * pop, `hsl(${(time * 140) % 360},100%,65%)`, 'center', 40, W * 0.92);
+  const a1 = clamp((t - 0.5) / 0.5, 0, 1);
+  ctx.globalAlpha = a1;
+  drawText('THE GALAXY IS SAVED', W / 2, y0 + big * 0.85, mid, '#00f0ff', 'center', 18, FW);
+  const y1 = y0 + big * 0.85 + mid * 2;
+  ctx.globalAlpha = clamp((t - 0.9) / 0.5, 0, 1);
+  drawText('SCORE ' + score.toLocaleString(), W / 2, y1, mid * 1.15, '#ffffff', 'center', 14, FW);
+  drawText('● ' + coinCount + '   BEST COMBO x' + bestMult, W / 2, y1 + mid * 1.35, mid * 0.75, '#ffdd55', 'center', 10, FW);
+  drawText('TIME ' + fmtTime(playTime), W / 2, y1 + mid * 2.4, mid * 0.75, '#8ab4ff', 'center', 10, FW);
+  drawText(newHigh ? '★ NEW HIGH SCORE ★' : 'HIGH SCORE ' + highScore.toLocaleString(), W / 2, y1 + mid * 3.6,
+    mid * (newHigh ? 0.95 + 0.06 * Math.sin(time * 8) : 0.75), '#ff2fd6', 'center', 16, FW);
+  ctx.globalAlpha = 1;
+  const b = victoryBtns();
+  // scrolling credits band
+  const top = y1 + mid * 4.8, bottom = Math.min(b.keep.y, b.again.y) - 14, bandH = bottom - top;
+  if (bandH > 50 && t > 1.2) {
+    ctx.save(); ctx.beginPath(); ctx.rect(0, top, W, bandH); ctx.clip();
+    const lh = Math.max(22, mid * 1.15), total = CREDITS.length * lh;
+    const offset = ((t - 1.2) * 32) % (total + bandH);
+    CREDITS.forEach(([txt, col, sz], i) => {
+      if (!txt) return;
+      const y = bottom + i * lh - offset + lh / 2;
+      if (y < top - lh || y > bottom + lh) return;
+      const edge = Math.min(y - top, bottom - y) / 30;
+      ctx.globalAlpha = clamp(edge, 0, 1);
+      drawText(txt, W / 2, y, mid * 0.75 * sz, col, 'center', 12, FW);
+    });
+    ctx.restore(); ctx.globalAlpha = 1;
+  }
+  if (t > 1.6) {
+    const a = clamp((t - 1.6) / 0.4, 0, 1) * (t < VICTORY_LOCK ? 0.5 : 1);
+    drawButton(b.keep, 'KEEP PLAYING', '#39ff14', a);
+    drawButton(b.again, 'PLAY AGAIN', '#00f0ff', a);
+    if (!isTouch && t >= VICTORY_LOCK) drawText('[K] KEEP PLAYING     [R] PLAY AGAIN', W / 2, b.again.y + b.again.h + 18, 11, 'rgba(200,220,255,0.6)', 'center', 0);
+  }
 }
 
 // =====================================================================
